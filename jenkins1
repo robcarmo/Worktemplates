@@ -1,0 +1,343 @@
+#!/usr/bin/env groovy
+
+import groovy.json.*
+import net.sf.json.*
+
+def devopsLibrary = library("com.dotdash.devops.cicd@${params.PIPELINE_BRANCH ?: 'master'}")
+def cicdPackage = devopsLibrary.com.dotdash.devops.cicd
+def CiCdUtilities = cicdPackage.CiCdUtilities.new(this).get()
+
+CiCdUtilities.Pipeline.defaultProperties(
+    [
+        CiCdUtilities.Parameter.parametersAction([
+            CiCdUtilities.Parameter.pipelineBranchParameter(),
+            string(defaultValue: '', description: 'User initiating the build', name: 'USER'),
+            string(defaultValue: '', description: 'Squadron Request Metadata', name: 'SQUADRON_METADATA'),
+            string(defaultValue: '', description: 'Project name', name: 'PROJECT'),
+            booleanParam(defaultValue: false, description: 'Dry run, don\'t publish any artifacts', name: 'DRY_RUN'),
+            booleanParam(defaultValue: false, description: 'Debug logging, switch all parts of the pipeline in to debug logging level', name: 'DEBUG_LOGGING'),
+            string(defaultValue: '', description: 'Type of container to deploy', name: 'CONTAINER_CLASS'),
+            string(defaultValue: '', description: 'uniqueId - required when referencing same container.class', name: 'UNIQUE_IDENTIFIER'),
+            string(defaultValue: '', description: 'Docker label used to get container\'s runtime configuration', name: 'CONTAINER_CONFIGURATION_LABEL'),
+            string(defaultValue: '', description: 'Type of artifact to deploy', name: 'BUILD_TYPE'),
+            string(defaultValue: '', description: 'Version of the task which to deploy', name: 'VERSION'),
+            CiCdUtilities.Parameter.cloudDeploymentParameter(),
+            CiCdUtilities.Parameter.cascadingAccountNameDeploymentParameter(),
+            CiCdUtilities.Parameter.cascadingRegionDeploymentParameter(),
+            CiCdUtilities.Parameter.stackDeploymentParameter(),
+            string(defaultValue: '', description: 'Environment to which to deploy', name: 'ENVIRONMENT'),
+            string(defaultValue: '', description: 'Name of ECS Container Cluster onto which to deploy', name: 'CLUSTER'),
+            string(defaultValue: '', description: 'Type of ECS  Cluster onto which to deploy', name: 'CLUSTER_TYPE'),
+            string(defaultValue: '', description: 'Environment to which to deploy', name: 'TASK_ENVIRONMENT_VARS'),
+            booleanParam(defaultValue: true, description: 'Wait for task run. If set to true, will wait for the task to run to its completion, or will fail if time out.', name: 'WAIT_FOR_TASK_COMPLETION'),
+            string(defaultValue: '180', description: 'Wait for task run. If set to true, will wait for the task to run to its completion, or will fail if time out.', name: 'DEFAULT_TASK_WAIT_TIME'),
+            string(defaultValue: '', description: 'Slack data for chaining messaging', name: 'SLACK_CHAINED_DATA')
+        ]),
+        pipelineTriggers([])
+    ]
+)
+
+// increase overall timeout to 3 hr if we want to wait for the task to completion, for safety measure
+int taskWaitTime = params.DEFAULT_TASK_WAIT_TIME as Integer
+CiCdUtilities.Pipeline.nodeWrapper(nodeLabel: 'jenkins-pipeline-1.1', timeout: (params.WAIT_FOR_TASK_COMPLETION ? taskWaitTime : 45) + 5) {
+  CiCdUtilities.Squadron.withSquadronNotification(
+    action     : 'create',
+    component  : [
+        class  : 'task',
+        name   : params.PROJECT,
+        type   : params.BUILD_TYPE,
+        version: params.VERSION,
+    ],
+  ) {
+    String lockResource = "container-task-deploy-or-destroy:${params.CLOUD}:${params.ACCOUNT_NAME}:${params.REGION}:${params.CLUSTER}:${params.ENVIRONMENT}:${params.PROJECT}:${params.CONTAINER_CLASS}:${params.UNIQUE_IDENTIFIER}"
+    String exceptionMsg = "Unable to acquire exclusive lock for: ${lockResource}. This may be due to the same container task being deploy or destroy on the same environment is currently in progress. Please try again later."
+    CiCdUtilities.GlobalLock.waitForExclusiveLock(lockResource, exceptionMsg: exceptionMsg) {
+      CiCdUtilities.ErrorHandling.catchErrantExceptions() {
+        def summaryLogFile = "${env.WORKSPACE}/summary_log.txt"
+        def displayNameParameters = [
+          params.PROJECT,
+          params.CONTAINER_CLASS,
+          params.BUILD_TYPE,
+          params.VERSION,
+          params.CLOUD,
+          params.REGION,
+          params.ACCOUNT_NAME,
+          params.ENVIRONMENT,
+          params.STACK,
+          params.CLUSTER,
+          params.CLUSTER_TYPE
+        ]
+
+        def accountId
+        def retryCount = 240 // 180 * 10s = 30m
+        String kibanaUrlText
+
+        def ansibleOutput
+        def taskStatus
+
+        def deploymentOptions = CiCdUtilities.Deployment.aggregateDeploymentOptions()
+        deploymentOptions.summaryLogFile = summaryLogFile
+
+        String deploymentPlaybook
+        String ansibleOptions
+
+        CiCdUtilities.Pipeline.Display.setBuildInformation(displayNameData: displayNameParameters, consoleMessage: kibanaUrlText, summaryLogFile: summaryLogFile)
+
+        String startTime = CiCdUtilities.Kibana.getCurrentTime(-300) // kibana epoch time is slightly off from jenkins epoch
+
+        stage('Validate Inputs') {
+          CiCdUtilities.Inputs.validateInputs(validateDeploymentParameters: true)
+        }
+
+        def manifestJson
+        stage('Read Container Task Manifest') {
+          manifestJson = CiCdUtilities.Docker.getManifestJsonfromContainer(params.CONTAINER_CLASS, params.BUILD_TYPE, params.PROJECT, params.VERSION, accountName: params.ACCOUNT_NAME, region: params.REGION, cloud: params.CLOUD, manifestLabel: params.CONTAINER_CONFIGURATION_LABEL)
+          deploymentOptions.manifestJson = manifestJson
+        }
+
+        CiCdUtilities.Deployment.withAnsibleDeploymentParameters(deploymentOptions, params) {
+          stage('Prepare Deployment Parameters') {
+            switch (params.STACK) {
+              case 'ecs':
+                deploymentPlaybook = 'ecs_task_deployment.yml'
+                break
+              case 'k8s':
+                deploymentPlaybook = 'k8s_task_deployment.yml'
+                break
+              default:
+                error("Unsupported stack [${params.STACK}]")
+            }
+
+            ansibleOptions = [
+              env.ANSIBLE_DEPLOYMENT_OPTIONS,
+              "-e container_class=${params.CONTAINER_CLASS}",
+              " -e kibana_url_file=kibana_urls.txt",
+              " -e manifest_label=${params.CONTAINER_CONFIGURATION_LABEL}"
+            ].join(' ')
+          }
+
+          dir('pipeline') {
+            git([url: "${CiCdUtilities.Constants.bitbucketBaseUrl}/scm/cicd/pipeline.git", branch: params.PIPELINE_BRANCH ?: 'master', credentialsId: 'aws_jenkins'])
+          }
+
+          try {
+            def masterAclToken
+            if (params.CLOUD == 'aws') {
+              stage('Fetch Consul Master ACL Token') {
+                masterAclToken = CiCdUtilities.Consul.getMasterAclToken(params.ACCOUNT_NAME, params.REGION)
+              }
+            }
+
+            wrap(
+              [$class: 'MaskPasswordsBuildWrapper', varPasswordPairs: [
+                [password: "${masterAclToken}", var: 'CONSUL_MASTER_ACL_TOKEN']
+              ]
+              ]) {
+
+              this.sendNotifications(CiCdUtilities, manifestJson, null, taskStatus, ansibleOutput)
+
+              // 10 min timeout for configuration deployment
+              timeout(10) {
+                CiCdUtilities.Config.configUpdateStage(
+                  cloud: params.CLOUD,
+                  accountName: params.ACCOUNT_NAME,
+                  region: params.REGION,
+                  project: params.PROJECT,
+                  stack: params.STACK,
+                  environment: params.ENVIRONMENT,
+                  manifestJson: manifestJson,
+                  vaultTransitKey: deploymentOptions?.stack?.vaultEnvVars?.VAULT_TRANSIT_KEY,
+                  configMapPath: deploymentOptions?.stack?.serviceEnvVars?.SERVICE_CONFIG_FILE,
+                  k8sClusterName: deploymentOptions?.stack?.k8sClusterName,
+                  squadronMetadata: params.SQUADRON_METADATA,
+                )
+              }
+
+              CiCdUtilities.Pipeline.Display.setBuildInformation(displayNameData: displayNameParameters, consoleMessage: kibanaUrlText, summaryLogFile: summaryLogFile)
+
+              dir('pipeline/shared/ansible') {
+                try {
+                  stage('Invoke Ansible Task Deployment') {
+                    CiCdUtilities.Ansible.RunPlaybookWithRetries([
+                      extras  : ansibleOptions,
+                      playbook: deploymentPlaybook
+                    ])
+                    // purge multiple Task ARNs from file to avoid errors
+                  }
+                } finally {
+                  if (fileExists('kibana_urls.txt')) {
+                    def kibanaUrls = sh(returnStdout: true, script: 'cat kibana_urls.txt | awk \'!a[$0]++\'').trim().split('\n')
+                    CiCdUtilities.Logging.Console.logInfo("kibanaUrls: ${kibanaUrls}")
+                    if (kibanaUrls && kibanaUrls.size() > 0) {
+                      kibanaUrlText = "<h2 style=\"color:#A11\">Kibana Logging Links, Per Task: "
+                      for (i = 0; i < kibanaUrls.size(); i++) {
+                        kibanaUrlText += " <a href=\"${kibanaUrls[i]}\">${i + 1}</a> "
+                      }
+                      kibanaUrlText += "</h2><br><h3>Please refer to this <a href=\"https://dotdash.atlassian.net/wiki/spaces/DEVOPS/pages/519405577/FAQ#FAQ-Mycontainerservicedeploymentfailed,howdoItroubleshoot?\">FAQ</a> for further guidance on troubleshooting and debugging.</h3>"
+                    }
+                    CiCdUtilities.Pipeline.Display.setBuildInformation(displayNameData: displayNameParameters, consoleMessage: kibanaUrlText, summaryLogFile: summaryLogFile)
+                  }
+
+                  def timeout = manifestJson && manifestJson.timeout ? manifestJson.timeout : 1200
+                  timeout = timeout > 1200 ? timeout : 1200  // Force 1200 seconds for timeout... Was finding certain tasks require more time
+                  def taskArn
+                  def jobInfo
+
+                  if (fileExists('task_arn.txt')) {
+                    taskArn = sh(returnStdout: true, script: 'tail -n1 task_arn.txt').trim()
+                  } else if (fileExists('job_info.json')) {
+                    jobInfo = readJSON(file: './job_info.json')
+                    taskArn = jobInfo.jobName
+                  }
+
+                  if (taskArn) {
+                    CiCdUtilities.Pipeline.updateBuildHeirarchy(['metadata': [
+                      taskArn: taskArn
+                    ] as net.sf.json.JSONObject
+                    ] as net.sf.json.JSONObject)
+                    CiCdUtilities.Pipeline.Display.setBuildInformation(displayNameData: displayNameParameters, consoleMessage: kibanaUrlText, summaryLogFile: summaryLogFile)
+
+                    if (params.WAIT_FOR_TASK_COMPLETION) {
+                      stage('Poll for Task Completion') {
+                        CiCdUtilities.Logging.Console.logImportant("Deployed, waiting for task run completion. Timeout: ${timeout}s")
+                        // default timeout of 5 min
+
+                        if (params.CLOUD == 'aws' && params.STACK == 'ecs') {
+                          taskStatus = CiCdUtilities.AWS.Ecs.checkDeployedTaskCompletion(params.ACCOUNT_NAME, taskArn, timeout, params.CLUSTER, params.REGION)
+                        } else if (params.STACK == 'k8s') {
+                          taskStatus = CiCdUtilities.K8S.checkDeployedJobCompletion(params.CLOUD, params.REGION, params.ACCOUNT_NAME, jobInfo.jobName, timeout, jobInfo.namespace, deploymentOptions?.stack?.k8sClusterName)
+                        }
+                        if (taskStatus == 'SUCCESS') {
+                          CiCdUtilities.Logging.Console.logSuccess("task ran successfully to completion.")
+                        } else {
+                          CiCdUtilities.Logging.Console.logError("failed to run task to completion. status - ${taskStatus}")
+                          if (params.CLOUD == 'aws' && params.STACK == 'ecs') {
+                            CiCdUtilities.AWS.Ecs.endTaskWithAccountName(params.CLUSTER, taskArn, accountName: params.ACCOUNT_NAME)
+                          }
+                          if (taskStatus == 'TIMEOUT') {
+                            error "Task fail at run time due to timeout."
+                          } else {
+                            error "Task has failed to run to completion."
+                          }
+                        }
+                      }
+                    }
+                  }
+
+
+                  if (fileExists('notification_output.json')) {
+                    try {
+                      ansibleOutput = readJSON(file: 'notification_output.json')
+                    } catch (err) {
+                      // TODO: internal error?
+                      CiCdUtilities.Logging.Console.logError("failed to parse file: notification_output.json")
+                      sh(script: 'cat notification_output.json')
+                    }
+                    sh(script: 'rm -rf notification_output.json')
+                  }
+                }
+                this.sendNotifications(CiCdUtilities, manifestJson, 'SUCCESS', taskStatus, ansibleOutput)
+              }
+            }
+          } catch (err) {
+            CiCdUtilities.Logging.Summary.logException('Pipeline job failed', err)
+            this.sendNotifications(CiCdUtilities, manifestJson, 'FAILED', taskStatus, ansibleOutput)
+            throw err
+          } finally {
+            stage('Summary Log') {
+              CiCdUtilities.Logging.Summary.echoLog()
+              CiCdUtilities.Pipeline.Display.setBuildInformation(displayNameData: displayNameParameters, consoleMessage: kibanaUrlText, summaryLogFile: summaryLogFile)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+def sendNotifications(CiCdUtilities, manifestJson, buildResult, taskStatus, ansibleOutput = null) {
+  try {
+    CiCdUtilities.Logging.Console.logDebug('Send Slack notification')
+
+    def fields = [
+        'Cloud'          : params.CLOUD,
+        'Account'        : params.ACCOUNT_NAME,
+        'Region'         : params.REGION,
+        'Cluster'        : params.CLUSTER,
+        'Cluster Type'   : params.CLUSTER_TYPE,
+        'Stack'          : params.STACK,
+        'Environment'    : params.ENVIRONMENT,
+        'Task'           : params.PROJECT,
+        'Version'        : params.VERSION,
+        'Container Class': params.CONTAINER_CLASS,
+        'Artifact Type'  : params.BUILD_TYPE
+    ]
+
+    if (env.READABLE_ANSIBLE_ERRORS) {
+      fields.put('Common Error', env.READABLE_ANSIBLE_ERRORS)
+    }
+
+    if (params.WAIT_FOR_TASK_COMPLETION) {
+      if (buildResult == 'FAILED') {
+        if (taskStatus == 'TIMEOUT') {
+          buildResult = 'TIMEOUT'
+        } else if (taskStatus != 'SUCCESS') {
+          buildResult = 'ERROR'
+        }
+      }
+
+      if (buildResult == 'SUCCESS' && taskStatus == 'SUCCESS') {
+        buildResult = 'COMPLETE'
+      }
+    }
+
+    if (manifestJson && manifestJson && manifestJson.scm && manifestJson.scm.http && manifestJson.scm.branch) {
+      fields << CiCdUtilities.Slack.buildGitBranchNotificationField(manifestJson.scm.http, manifestJson.scm.branch)
+    }
+
+    if (ansibleOutput) {
+      fields << ansibleOutput
+    }
+
+    def channels = [CiCdUtilities.Constants.slackChannelCiCdDeploy]
+    if (params.ACCOUNT_NAME == 'prod') {
+      channels.add(CiCdUtilities.Constants.slackChannelProdDeploy)
+    }
+    if (buildResult && manifestJson && manifestJson.maintainers && manifestJson.maintainers.slack) {
+      channels.addAll(manifestJson.maintainers.slack)
+    }
+    if (manifestJson && manifestJson.notifications) {
+      if (manifestJson.notifications.channels && manifestJson.notifications.channels.isArray() && manifestJson.notifications.channels.size() > 0) {
+        channels.addAll(manifestJson.notifications.channels)
+      } else if (manifestJson.notifications[params.ACCOUNT_NAME] && manifestJson.notifications[params.ACCOUNT_NAME].slack && manifestJson.notifications[params.ACCOUNT_NAME].slack.channels && manifestJson.notifications[params.ACCOUNT_NAME].slack.channels.isArray() && manifestJson.notifications[params.ACCOUNT_NAME].slack.channels.size() > 0) {
+        channels.addAll(manifestJson.notifications[params.ACCOUNT_NAME].slack.channels)
+      }
+    }
+
+    CiCdUtilities.Slack.sendCiCdNotification(
+        channels,
+        [
+            SUCCESS : 'Container Task Deployment Successful',
+            COMPLETE: 'Container Task Execution Successful',
+            FAILED  : 'Container Task Deployment Failed',
+            ERROR   : 'Container Task Execution Failed',
+            TIMEOUT : 'Container Task Execution Timed Out'
+        ],
+        env.BUILD_URL,
+        buildResult,
+        [
+            SUCCESS : ':tada:',
+            COMPLETE: ':tada:',
+            FAILED  : ':boom:',
+            ERROR   : ':exclamation:',
+            TIMEOUT : ':question:',
+            STARTED : ':helicopter:',
+        ],
+        env.EFFECTIVE_USER,
+        fields
+    )
+  } catch (err) {
+    // internal error?
+    CiCdUtilities.Logging.Console.logError('sendNotifications failure.', err)
+  }
+}
