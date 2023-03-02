@@ -1,0 +1,374 @@
+#!/bin/bash
+
+function echoColor() {
+  echo -e "\033[1;${1}m${2}\033[0m"
+}
+
+function setAWSProfiles_toFile() {
+  ACCOUNT_NO=$(echo "${AWS_ACCOUNTS}" | jq ".${1}")
+  JSON_CREDS=$(aws sts assume-role --role-arn "arn:aws:iam::${ACCOUNT_NO}:role/JenkinsSlaveCrossAcctRole" --role-session-name kms-config-re-encrypt )
+
+  /bin/cat <<EOM > "${DIRECTORY}/_${UUID_DIR}_${1}_profile"
+  AWS_ACCESS_KEY_ID=$(echo "$JSON_CREDS" | jq -r '.Credentials.AccessKeyId')
+  AWS_SECRET_ACCESS_KEY=$(echo "$JSON_CREDS" | jq -r '.Credentials.SecretAccessKey')
+  AWS_SECURITY_TOKEN=$(echo "$JSON_CREDS" | jq -r '.Credentials.SessionToken')
+EOM
+}
+
+function echoColor() {
+  echo -e "\033[1;${1}m${2}\033[0m"
+}
+
+# Public: sets vault params as env-vars
+# $1 VAULT_HOST
+# $2 account_name (qa/prod/test/cicd)
+# $3 region (us-east-1/us-west-2)
+# Returns with exit code of export
+function setAwsVaultCredentials() {
+
+  VAULT_HOST="$1"
+  VAULT_ADDR="https://${VAULT_HOST}"
+  export VAULT_ADDR
+  VTOKEN=$(vault login -method=aws region="${3}" header_value="${VAULT_HOST}" role=jenkins-cicd \
+      aws_access_key_id="${AWS_ACCESS_KEY_ID}" \
+      aws_secret_access_key="${AWS_SECRET_ACCESS_KEY}" \
+      aws_security_token="${AWS_SECURITY_TOKEN}" \
+      -format=json | jq -r '.auth.client_token')
+
+  if [ -z "${VTOKEN}" ]; then
+      echoColor 31 "Unable to get vault token, failing. ${1} ${2} ${3}"
+      exit 1
+  fi
+
+  /bin/cat <<EOM > "${DIRECTORY}/_${UUID_DIR}_${VAULT_HOST}_profile"
+    VAULT_TOKEN=${VTOKEN}
+    VAULT_ADDR=${VAULT_ADDR}
+EOM
+  unset VAULT_ADDR
+}
+
+# Public: sets vault params as env-vars
+# $1 VAULT_HOST
+# $2 credential filepath
+# Returns with exit code of export
+function setGcpVaultCredentials() {
+
+  VAULT_HOST="$1"
+  VAULT_ADDR="https://${VAULT_HOST}"
+  export VAULT_ADDR
+  SERVICE_ACCOUNT=$(jq -r '.client_email' "${2}")""
+  VTOKEN=$(vault login -method=gcp role=jenkins-cicd \
+      service_account="${SERVICE_ACCOUNT}" \
+      username="${SERVICE_ACCOUNT}" \
+      jwt_exp="15m" \
+      credentials="@${2}" \
+      -format=json | jq -r '.auth.client_token')
+
+  if [ -z "${VTOKEN}" ]; then
+      echoColor 31 "Unable to get vault token, failing. ${1} ${2} ${3}"
+      exit 1
+  fi
+
+/bin/cat <<EOM > "${DIRECTORY}/_${UUID_DIR}_${VAULT_HOST}_profile"
+    VAULT_TOKEN=${VTOKEN}
+    VAULT_ADDR=${VAULT_ADDR}
+EOM
+  unset VAULT_ADDR
+}
+
+function showUsage() {
+  echo "" >&2
+  echo "USAGE: ./re_encryption_for_envs.sh" >&2
+  echo "" >&2
+  echo "This utility is used to translate KMS encrypted config values for all branches in a repo" >&2
+  echo "valid options are listed below:" >&2
+  echo "" >&2
+  echo "  common options" >&2
+  echo "  ----------------------------------------------------------------" >&2
+  echo "   -a [AWS_ACCOUNTS]                  JSON Input with all account_names and account_numbers" >&2
+  echo "   -k [TARGET_AWS_ACCOUNT]            Encrypt config in this account" >&2
+  echo "   -r [TARGET_AWS_REGION]             Encrypt config in this region" >&2
+  echo "   -l [CLOUD]                         Encrypt config for this cloud vendor" >&2
+  echo "   -c [CONFIG_KMS_KEYS]               JSON Input with all kms key ids across accounts/region" >&2
+  echo "   -p [TARGET_GCP_PROJECT]            (CURRENTLY UNUSED, NECESSARY FOR QA GCP PROJECT) Encrypt config in this account" >&2
+  echo "   -g [TARGET_GCP_REGION]             (CURRENTLY UNUSED, NECESSARY FOR QA GCP PROJECT) Encrypt config in this region" >&2
+  echo "   -n [TARGET_GCP_CREDENTIALS]        GCP Credentials to authenticate with GCP Vault" >&2
+  echo "   -f [INPUT_FILE]                    Encrypt config filename" >&2
+  echo "   -e [VAULT_CLUSTER_FOR_ENCRYPTION]  Vault server to encrypt with, needed when stack is k8s" >&2
+  echo "   -d [VAULT_CLUSTER_FOR_DECRYPTION]  Vault server to decrypt with" >&2
+  echo "   -t [VAULT_TRANSIT_KEY]             vault key used for (en/de)cryption " >&2
+  echo "   -s [STACK]                         ecs / k8s " >&2
+  echo "   [-v [verbose]]                     For Debugging" >&2
+  exit 1
+}
+
+function reencrypt_configuration() {
+  # @Args: "${INPUT_FILE}" "${CLOUD}" "${AWS_ACCOUNT}" "${AWS_REGION}" "${GCP_PROJECT}" "${GCP_REGION}" "${KMS_KEY_ID}"
+
+  CONFIG_PROPERTIES_FILE="${1}"
+  CLOUD="${2}"
+  AWS_ACCOUNT="${3}"
+  AWS_REGION="${4}"
+  GCP_PROJECT="${5}"
+  GCP_REGION="${6}"
+  KMS_KEY_ID="${7}"
+
+  if [ "${CLOUD}" == "aws" ]; then
+    [ "${AWS_ACCOUNT}" == 'prod' ] && ENCRYPT_REGION_OPTS="--region ${AWS_REGION}" || ENCRYPT_REGION_OPTS='--region us-east-1'
+  fi
+
+  echoColor 32 "CONFIG_PROPERTIES_FILE:${CONFIG_PROPERTIES_FILE} AWS_ACCOUNT:${AWS_ACCOUNT} ${ENCRYPT_REGION_OPTS}"
+  lineNo=0
+  ALL_REGIONS=('us-east-1' 'us-west-2')
+  ALL_ACCOUNTS=('qa' 'prod' 'test' 'cicd')
+
+  sed -i -e '$a\' "${CONFIG_PROPERTIES_FILE}"
+  while IFS= read -r line; do
+    ((lineNo++))
+    if [[ $( echo "${line}" | grep -cE "^([^#=]+)=(.*)$" ) -lt 1 ]]; then
+      continue
+    fi
+    KEY=$(echo "${line}" | sed -E 's;^([^#=]+)=(.*)$;\1;g')
+    VALUE=$(echo "${line}" | sed -E 's;^([^#=]+)=(.*)$;\2;g')
+    DECRYPTED=""
+    UUID=$(uuidgen)
+    CIPHERTEXT_FILE="${DIRECTORY}/_config_kms_translate_${UUID}.ciphertext"
+    echo "${VALUE}" | base64 -d 2>/dev/null > "${CIPHERTEXT_FILE}"
+    RESULT="${?}"
+    SIZE=$(stat --printf="%s" "${CIPHERTEXT_FILE}")
+
+    if [[ "${VALUE}" =~ ^vault:.+ ]]; then
+
+      set -a
+
+      source "${DIRECTORY}/_${UUID_DIR}_prod_profile"
+      source "${DIRECTORY}/_${UUID_DIR}_${VAULT_CLUSTER_FOR_DECRYPTION}_profile"
+
+      DECRYPTED=$(vault write "transit/decrypt/${VAULT_TRANSIT_KEY}" ciphertext="${VALUE}" -format=json | jq -r '.data.plaintext' | base64 -d)
+
+      if [ -n "${DECRYPTED}" ]; then
+        echoColor 32  "${lineNo} - [${KEY}] ${AWS_ACCOUNT} ${VAULT_HOST}  Decrypted Successfully"
+      else
+        echoColor 31 "${lineNo}: [${KEY}]  ${AWS_ACCOUNT} Could not be decrypted"
+      fi
+      set +a
+
+    elif [[ "${VALUE}" =~ ^AQ.+ ]] && [ "${RESULT}" -eq "0" ] && [ "${SIZE}" -gt "100" ]; then
+      #  Iterate over all accounts (qa,prod,test, cicd)/ regions(east,west) to decrypt.
+
+      for EACH_ACCOUNT in "${ALL_ACCOUNTS[@]}" ; do
+        set -a; source "${DIRECTORY}/_${UUID_DIR}_${EACH_ACCOUNT}_profile"
+        if [ "${EACH_ACCOUNT}" == 'qa' ] || [ "${EACH_ACCOUNT}" == 'test' ] ; then
+          DECRYPT_REGION_OPTS="--region us-east-1"
+          DECRYPTED="$(aws ${DECRYPT_REGION_OPTS} kms decrypt --ciphertext-blob "fileb://${CIPHERTEXT_FILE}" --output text --query Plaintext 2>/dev/null| base64 -d)"
+          if [ -n "${DECRYPTED}" ]; then
+            echoColor 32  "${lineNo} - [${KEY}] ${EACH_ACCOUNT} ${DECRYPT_REGION_OPTS}  Decrypted Successfully"
+            break
+          fi
+        else
+          for each_region in "${ALL_REGIONS[@]}" ; do
+            DECRYPT_REGION_OPTS="--region ${each_region}"
+            DECRYPTED="$(aws ${DECRYPT_REGION_OPTS} kms decrypt --ciphertext-blob "fileb://${CIPHERTEXT_FILE}" --output text --query Plaintext 2>/dev/null| base64 -d)"
+            if [ -n "${DECRYPTED}" ]; then
+              echoColor 32  "${lineNo} -  [${KEY}] ${EACH_ACCOUNT} ${DECRYPT_REGION_OPTS}  Decrypted Successfully"
+              break
+            fi
+          done
+          if [ -n "${DECRYPTED}" ]; then
+            break
+          fi
+        fi
+        set +a
+        [ -z "${DECRYPTED}" ] && echoColor 31 "${lineNo}: [${KEY}]  ${EACH_ACCOUNT} ${DECRYPT_REGION_OPTS} Could not be decrypted"
+      done
+    #else
+      # echoColor 34 "${lineNo}: [${KEY}] Not an encrypted value"
+    fi
+
+    if [ -n "${DECRYPTED}" ]; then
+      if [ "${CLOUD}" == "aws" ]; then
+        if [ "${AWS_ACCOUNT}" != "cicd" ]; then
+          set -a ; source "${DIRECTORY}/_${UUID_DIR}_${AWS_ACCOUNT}_profile"
+            KMS_ENCRYPTED=$(aws ${ENCRYPT_REGION_OPTS} kms encrypt --key-id ${KMS_KEY_ID} --plaintext "${DECRYPTED}" --output text --query CiphertextBlob 2>/dev/null)
+            fi
+            if [ "${STACK}" == k8s ]; then
+              source "${DIRECTORY}/_${UUID_DIR}_${VAULT_CLUSTER_FOR_ENCRYPTION}_profile"
+
+              #   base64 -w  --wrap=COLS wrap encoded lines after COLS character (default 76).  Use 0 to disable line wrapping
+              VAULT_ENCRYPTED=$(vault write "transit/encrypt/${VAULT_TRANSIT_KEY}" "plaintext=$(echo -n "${DECRYPTED}" | base64 -w 0)" -format=json | jq -r '.data.ciphertext')
+            fi
+            set +a
+
+          if [ -z "${KMS_ENCRYPTED}" ] || { [ "${STACK}" == "k8s" ] && [ -z "${VAULT_ENCRYPTED}" ]; } ; then
+            echoColor 31 "${lineNo}: Encryption failed: [${KEY}]"
+            exit 1
+          else
+            echoColor 34 "${lineNo}: Value for Key has been ReEncrypted: [${KEY}] ${ENCRYPT_REGION_OPTS}"
+            sed -i "${lineNo}"'s;.*;'"${KEY}"'='"${KMS_ENCRYPTED}"';' "${CONFIG_PROPERTIES_FILE}"
+
+            if [ "${STACK}" == k8s ]; then
+              sed -i "${lineNo}"'s;.*;'"${KEY}"'='"${VAULT_ENCRYPTED}"';' "${CONFIG_PROPERTIES_FILE}_vault"
+            fi
+          fi
+        elif [ "${CLOUD}" == "gcp" ]; then
+          if [ "${STACK}" == "k8s" ]; then
+            source "${DIRECTORY}/_${UUID_DIR}_${VAULT_CLUSTER_FOR_ENCRYPTION}_profile"
+
+            #   base64 -w  --wrap=COLS wrap encoded lines after COLS character (default 76).  Use 0 to disable line wrapping
+            VAULT_ENCRYPTED=$(vault write "transit/encrypt/${VAULT_TRANSIT_KEY}" "plaintext=$(echo -n "${DECRYPTED}" | base64 -w 0)" -format=json | jq -r '.data.ciphertext')
+
+            if [ -z "${VAULT_ENCRYPTED}" ] ; then
+              echoColor 31 "${lineNo}: Encryption failed: [${KEY}]"
+              exit 1
+            else
+              sed -i "${lineNo}"'s;.*;'"${KEY}"'='"${VAULT_ENCRYPTED}"';' "${CONFIG_PROPERTIES_FILE}_vault"
+            fi
+          fi
+          set +a
+        else
+          echoColor 34 "${lineNo}: [${CLOUD}] Not invalid"
+        fi
+      #else
+        # echoColor 34 "${lineNo}: [${KEY}] Not an encrypted value"
+      fi
+      rm "${CIPHERTEXT_FILE}"
+    done < <(cat "${CONFIG_PROPERTIES_FILE}")
+    rm ${DIRECTORY}/_${UUID_DIR}_*_profile || echoColor 31 "Unable to cleanup profile files."
+}
+
+while getopts "l:p:g:a:k:r:c:f:n:d:e:s:t:v" opt; do
+  case "${opt}" in
+    l)
+      CLOUD="${OPTARG}"
+    ;;
+    a)
+      AWS_ACCOUNTS="${OPTARG}"
+    ;;
+    k)
+      TARGET_AWS_ACCOUNT="${OPTARG}"
+    ;;
+    r)
+      TARGET_AWS_REGION="${OPTARG}"
+    ;;
+    p)
+      TARGET_GCP_PROJECT="${OPTARG}"
+    ;;
+    g)
+      TARGET_GCP_REGION="${OPTARG}"
+    ;;
+    n)
+      TARGET_GCP_CREDENTIALS="${OPTARG}"
+    ;;
+    c)
+      CONFIG_KMS_KEYS="${OPTARG}"
+    ;;
+    f)
+      INPUT_FILE="${OPTARG}"
+    ;;
+    d)
+      VAULT_CLUSTER_FOR_DECRYPTION="${OPTARG}"
+    ;;
+    e)
+      VAULT_CLUSTER_FOR_ENCRYPTION="${OPTARG}"
+    ;;
+    s)
+      STACK="${OPTARG}"
+    ;;
+    t)
+      VAULT_TRANSIT_KEY="${OPTARG}"
+    ;;
+    v)
+      VERBOSE=true
+      ;;
+    \?)
+      echoColor 31 "Invalid option: -${OPTARG}" >&2
+      showUsage
+      exit 1
+      ;;
+    :)
+      echoColor 31 "Option -${OPTARG} requires an argument" >&2
+      showUsage
+      exit 1
+      ;;
+  esac
+done
+shift $((OPTIND-1))
+
+VALID_CLOUDS=" aws gcp "
+if [[ "${VALID_CLOUDS}" != *" ${CLOUD} "* ]]; then
+  echoColor 31  "Required parameter  CLOUD: ['${CLOUD}'] is invalid, must be one of [${VALID_CLOUDS}]" >&2
+  showUsage
+  exit 1
+fi
+
+if [ -z "${AWS_ACCOUNTS}" ] || [ -z "${TARGET_AWS_REGION}" ] || [ -z "${TARGET_AWS_ACCOUNT}" ] || [ -z "${CONFIG_KMS_KEYS}" ] || [ -z "${VAULT_CLUSTER_FOR_DECRYPTION}" ] || [ -z "${STACK}" ] || [ -z "${VAULT_TRANSIT_KEY// }" ]; then
+  echoColor 31  "Required parameter: AWS_ACCOUNTS OR TARGET_AWS_REGION OR TARGET_AWS_ACCOUNT OR CONFIG_KMS_KEYS OR VAULT_CLUSTER_FOR_DECRYPTION OR STACK OR VAULT_TRANSIT_KEY is missing" >&2
+  showUsage
+  exit 1
+fi
+
+if [ "${STACK}" == 'k8s' ] && [ -z "${VAULT_CLUSTER_FOR_ENCRYPTION// }" ]; then
+  echoColor 31  "Required parameter  VAULT_CLUSTER_FOR_ENCRYPTION: ['${VAULT_CLUSTER_FOR_ENCRYPTION}'] is invalid for stack ${STACK}" >&2
+  showUsage
+  exit 1
+fi
+
+if [ "${CLOUD}" == 'gcp' ] && [ -n "${TARGET_GCP_PROJECT}" ] && [ -z "${TARGET_GCP_REGION}" ] && [ -f "${TARGET_GCP_CREDENTIALS}" ]; then
+  echoColor 31  "TARGET_GCP_PROJECT [${TARGET_GCP_PROJECT}], TARGET_GCP_REGION [${TARGET_GCP_REGION}] and TARGET_GCP_CREDENTIALS [${TARGET_GCP_CREDENTIALS}] must be provided to perform GCP vault encryption." >&2
+  showUsage
+  exit 1
+fi
+
+if [ ! -f "${INPUT_FILE}" ] ; then
+  echoColor 31  "Required parameter INPUT_FILE: [${INPUT_FILE}] is invalid" >&2
+  showUsage
+  exit 1
+fi
+
+if ${VERBOSE:-false} ; then
+  set -x
+fi
+
+UUID_DIR=$(uuidgen)
+DIRECTORY="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+setAWSProfiles_toFile qa
+setAWSProfiles_toFile prod
+setAWSProfiles_toFile test
+setAWSProfiles_toFile cicd
+
+set -a
+  source "${DIRECTORY}/_${UUID_DIR}_prod_profile"
+  setAwsVaultCredentials "${VAULT_CLUSTER_FOR_DECRYPTION}" prod 'us-east-1'
+set +a
+
+if [ "${CLOUD}" == "aws" ]; then
+  TARGET_KMS_KEY_ID=$(echo "${CONFIG_KMS_KEYS}" | jq -r ".config_kms_keys.\"${TARGET_AWS_ACCOUNT}\".\"${TARGET_AWS_REGION}\"")
+  if [ -z "${TARGET_KMS_KEY_ID}" ]; then
+    echoColor 31  "Could not Fetch KEY.. Quitting." >&2
+    exit 1
+  fi
+fi
+
+if [ "${STACK}" == "k8s" ]; then
+  set -a
+    source "${DIRECTORY}/_${UUID_DIR}_${TARGET_AWS_ACCOUNT}_profile"
+    case "${CLOUD}" in
+      aws)
+        setAwsVaultCredentials "${VAULT_CLUSTER_FOR_ENCRYPTION}" "${TARGET_AWS_ACCOUNT}" "${TARGET_AWS_REGION}"
+      ;;
+      gcp)
+        setGcpVaultCredentials "${VAULT_CLUSTER_FOR_ENCRYPTION}" "${TARGET_GCP_CREDENTIALS}"
+      ;;
+      :)
+        echoColor 31 "Invalid value for cloud:${CLOUD}" >&2
+        showUsage
+        exit 1
+        ;;
+    esac
+
+  set +a
+  cp "${INPUT_FILE}" "${INPUT_FILE}_vault"
+fi
+
+
+reencrypt_configuration "${INPUT_FILE}" "${CLOUD}" "${TARGET_AWS_ACCOUNT}" "${TARGET_AWS_REGION}" "${TARGET_GCP_ACCOUNT}" "${TARGET_GCP_REGION}" "${TARGET_KMS_KEY_ID}"
